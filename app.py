@@ -12,17 +12,14 @@ DB_NAME = 'njuskalo_tracker.db'
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Tablica za tabove (filtere)
     c.execute('''CREATE TABLE IF NOT EXISTS filters
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)''')
-    # Tablica za oglase
     c.execute('''CREATE TABLE IF NOT EXISTS items
                  (ad_id TEXT, filter_id INTEGER, title TEXT, link TEXT, 
                   current_price INTEGER, previous_price INTEGER, 
                   price_drop INTEGER, description TEXT, last_updated TEXT,
                   PRIMARY KEY(ad_id, filter_id))''')
     
-    # Ubaci inicijalni GLC filter ako je baza prazna
     c.execute("SELECT count(*) FROM filters")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO filters (name, url) VALUES (?, ?)",
@@ -52,19 +49,16 @@ def scrape_all_filters():
             uspjesno = 0
             for item in items:
                 try:
-                    # Link i naslov
                     link_tag = item.find('a', href=re.compile(r'-oglas-\d+'))
                     if not link_tag: continue
                     href = link_tag.get('href', '')
                     link = "https://www.njuskalo.hr" + href if href.startswith('/') else href
                     title = link_tag.text.strip()
                     
-                    # ID Oglasa
                     id_match = re.search(r'oglas-(\d+)', href)
                     if not id_match: continue
                     ad_id = id_match.group(1)
                     
-                    # Cijena
                     price_str = ""
                     price_tag = item.find(class_=re.compile(r'price--eur|price'))
                     if price_tag and '€' in price_tag.text:
@@ -76,15 +70,12 @@ def scrape_all_filters():
                     if not price_str: continue
                     price = int(re.sub(r'\D', '', price_str))
                     
-                    # Univerzalni Opis (hvata kratki opis ispod naslova)
                     desc_tag = item.find('div', class_='entity-description-main')
                     desc_text = desc_tag.text.replace('\xa0', ' ').strip() if desc_tag else ""
-                    # Skrati opis ako je predug
                     if len(desc_text) > 80: desc_text = desc_text[:77] + "..."
 
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # Provjera u bazi za Price Drop
                     c.execute("SELECT current_price, price_drop FROM items WHERE ad_id=? AND filter_id=?", (ad_id, filter_id))
                     row = c.fetchone()
                     
@@ -129,7 +120,9 @@ HTML = """
         
         .container { padding: 15px; }
         .actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .btn-refresh { background: #34a853; color: white; text-decoration: none; padding: 8px 15px; border-radius: 8px; font-weight: bold; font-size: 14px; }
+        .btn-group { display: flex; gap: 8px; }
+        .btn-refresh { background: #34a853; color: white; text-decoration: none; padding: 8px 12px; border-radius: 8px; font-weight: bold; font-size: 13px; }
+        .btn-delete { background: #d32f2f; color: white; border: none; padding: 8px 12px; border-radius: 8px; font-weight: bold; font-size: 13px; cursor: pointer; }
         
         .card { background: white; margin-bottom: 12px; padding: 15px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .title { font-size: 16px; font-weight: bold; margin-bottom: 5px; display: block; color: #1a73e8; text-decoration: none; }
@@ -137,7 +130,6 @@ HTML = """
         .price { font-size: 18px; font-weight: bold; color: #1b5e20; }
         .drop { background: #e53935; color: white; padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: bold; margin-left: 10px; vertical-align: text-bottom;}
         
-        /* Modal za dodavanje */
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 200; justify-content: center; align-items: center; }
         .modal-content { background: white; padding: 20px; border-radius: 12px; width: 90%; max-width: 400px; }
         .modal h3 { margin-top: 0; }
@@ -160,7 +152,14 @@ HTML = """
     <div class="container">
         <div class="actions">
             <h3 style="margin:0; color:#333;">Oglasi</h3>
-            <a href="/scrape?f={{ current_filter }}" class="btn-refresh">🔄 Osvježi</a>
+            <div class="btn-group">
+                <a href="/scrape?f={{ current_filter }}" class="btn-refresh">🔄 Osvježi</a>
+                {% if current_filter %}
+                <form action="/delete_filter/{{ current_filter }}" method="POST" onsubmit="return confirm('Jesi li siguran da želiš obrisati ovaj tab i sve njegove oglase?');" style="margin:0;">
+                    <button type="submit" class="btn-delete">🗑️ Obriši</button>
+                </form>
+                {% endif %}
+            </div>
         </div>
         
         {% if not items %}
@@ -205,38 +204,43 @@ HTML = """
 def index():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    
-    # Dohvati sve filtere za Tabove
     c.execute("SELECT id, name FROM filters")
     filters = c.fetchall()
     
-    # Koji tab prikazujemo? (Zadani je prvi iz baze)
     current_filter = request.args.get('f', type=int)
     if not current_filter and filters:
         current_filter = filters[0][0]
         
-    # Dohvati oglase za trenutni tab (sortirano po datumu i padu cijene)
     c.execute("SELECT * FROM items WHERE filter_id=? ORDER BY price_drop DESC, last_updated DESC", (current_filter,))
     items = c.fetchall()
-    
     conn.close()
+    
     return render_template_string(HTML, filters=filters, current_filter=current_filter, items=items)
 
 @app.route('/add_filter', methods=['POST'])
 def add_filter():
     name = request.form['name']
     url = request.form['url']
-    
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("INSERT INTO filters (name, url) VALUES (?, ?)", (name, url))
     new_id = c.lastrowid
     conn.commit()
     conn.close()
-    
-    # Odmah pokreni scrape da se tab napuni
     scrape_all_filters()
     return redirect(url_for('index', f=new_id))
+
+@app.route('/delete_filter/<int:filter_id>', methods=['POST'])
+def delete_filter(filter_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Brišemo filter
+    c.execute("DELETE FROM filters WHERE id=?", (filter_id,))
+    # Brišemo i sve oglase koji pripadaju tom filteru kako ne bi ostali kao "smeće" u bazi
+    c.execute("DELETE FROM items WHERE filter_id=?", (filter_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('index'))
 
 @app.route('/scrape')
 def run_scrape():
@@ -246,5 +250,4 @@ def run_scrape():
 
 if __name__ == '__main__':
     init_db()
-    # Pokreni inicijalni scrape u pozadini ako je prazno
     app.run(host='0.0.0.0', port=5000)
