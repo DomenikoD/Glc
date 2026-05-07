@@ -3,171 +3,200 @@ from bs4 import BeautifulSoup
 import sqlite3
 import re
 from datetime import datetime
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request, redirect, url_for
 
 app = Flask(__name__)
-DB_NAME = 'glc_podaci.db'
+DB_NAME = 'njuskalo_tracker.db'
 
+# --- BAZA PODATAKA ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS cars
-                 (id TEXT PRIMARY KEY, title TEXT, link TEXT, 
+    # Tablica za tabove (filtere)
+    c.execute('''CREATE TABLE IF NOT EXISTS filters
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)''')
+    # Tablica za oglase
+    c.execute('''CREATE TABLE IF NOT EXISTS items
+                 (ad_id TEXT, filter_id INTEGER, title TEXT, link TEXT, 
                   current_price INTEGER, previous_price INTEGER, 
-                  year INTEGER, mileage INTEGER, 
-                  price_drop INTEGER, best_buy_score INTEGER, last_updated TEXT)''')
+                  price_drop INTEGER, description TEXT, last_updated TEXT,
+                  PRIMARY KEY(ad_id, filter_id))''')
+    
+    # Ubaci inicijalni GLC filter ako je baza prazna
+    c.execute("SELECT count(*) FROM filters")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO filters (name, url) VALUES (?, ?)",
+                  ("Mercedes GLC", "https://www.njuskalo.hr/auti/mercedes-glc?price[max]=50000&yearManufactured[min]=2019&mileage[max]=180000&accountPurpose=private"))
     conn.commit()
     conn.close()
 
-def calculate_best_buy(price, year, mileage):
-    if price == 0: return 0
-    base_value = 36000
-    year_bonus = (year - 2019) * 3500
-    mileage_penalty = ((mileage - 100000) / 10000) * 900
-    return int((base_value + year_bonus - mileage_penalty) - price)
-
-def scrape_njuskalo():
-    url = "https://www.njuskalo.hr/auti/mercedes-glc?price[max]=50000&yearManufactured[min]=2019&mileage[max]=180000&accountPurpose=private"
+# --- UNIVERZALNI SCRAPER ---
+def scrape_all_filters():
     scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
     
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Započinjem obradu...")
+    c.execute("SELECT id, name, url FROM filters")
+    filters = c.fetchall()
     
-    try:
-        response = scraper.get(url)
-        soup = BeautifulSoup(response.content, 'html.parser')
+    for f in filters:
+        filter_id, f_name, url = f[0], f[1], f[2]
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Skeniram: {f_name}")
         
-        items = soup.find_all('li', class_=re.compile(r'EntityList-item'))
-        print(f"Pronađeno HTML elemenata (oglasa): {len(items)}")
-        
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        
-        uspjesno_spremljeno = 0
-        
-        for item in items:
-            try:
-                # 1. LINK I NASLOV (Tražimo bilo koji link koji u sebi ima riječ 'oglas')
-                link_tag = item.find('a', href=re.compile(r'-oglas-\d+'))
-                if not link_tag:
-                    continue # Nije oglas (možda reklama ili naslov)
+        try:
+            response = scraper.get(url)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            items = soup.find_all('li', class_=re.compile(r'EntityList-item'))
+            print(f"Pronađeno {len(items)} potencijalnih elemenata.")
+            
+            uspjesno = 0
+            for item in items:
+                try:
+                    # Link i naslov
+                    link_tag = item.find('a', href=re.compile(r'-oglas-\d+'))
+                    if not link_tag: continue
+                    href = link_tag.get('href', '')
+                    link = "https://www.njuskalo.hr" + href if href.startswith('/') else href
+                    title = link_tag.text.strip()
                     
-                href = link_tag.get('href', '')
-                link = "https://www.njuskalo.hr" + href if href.startswith('/') else href
-                title = link_tag.text.strip()
-                if not title: title = "Mercedes-Benz GLC"
-                
-                # 2. ID OGLASA (Vadimo broj iz samog linka)
-                id_match = re.search(r'oglas-(\d+)', href)
-                if not id_match:
-                    print("-> Preskočeno: Ne mogu izvući ID iz linka.")
-                    continue
-                ad_id = id_match.group(1)
-                
-                # 3. CIJENA (Skenira cijeli tekst bloka i traži format '35.000 €' ili '35000 €')
-                price_str = ""
-                price_tag = item.find(class_=re.compile(r'price--eur|price'))
-                if price_tag and '€' in price_tag.text:
-                    price_str = price_tag.text.split(',')[0]
-                else:
-                    price_match = re.search(r'([\d\.]+)\s*€', item.text)
-                    if price_match: price_str = price_match.group(1)
-                
-                if not price_str:
-                    print(f"-> Preskočeno ({ad_id}): Nije pronađena cijena.")
-                    continue
+                    # ID Oglasa
+                    id_match = re.search(r'oglas-(\d+)', href)
+                    if not id_match: continue
+                    ad_id = id_match.group(1)
                     
-                price = int(re.sub(r'\D', '', price_str))
-                if price < 5000: # Osigurač (npr. rata leasinga umjesto cijene)
-                    print(f"-> Preskočeno ({ad_id}): Cijena manja od 5000€ ({price}€).")
+                    # Cijena
+                    price_str = ""
+                    price_tag = item.find(class_=re.compile(r'price--eur|price'))
+                    if price_tag and '€' in price_tag.text:
+                        price_str = price_tag.text.split(',')[0]
+                    else:
+                        price_match = re.search(r'([\d\.]+)\s*€', item.text)
+                        if price_match: price_str = price_match.group(1)
+                    
+                    if not price_str: continue
+                    price = int(re.sub(r'\D', '', price_str))
+                    
+                    # Univerzalni Opis (hvata kratki opis ispod naslova)
+                    desc_tag = item.find('div', class_='entity-description-main')
+                    desc_text = desc_tag.text.replace('\xa0', ' ').strip() if desc_tag else ""
+                    # Skrati opis ako je predug
+                    if len(desc_text) > 80: desc_text = desc_text[:77] + "..."
+
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    # Provjera u bazi za Price Drop
+                    c.execute("SELECT current_price, price_drop FROM items WHERE ad_id=? AND filter_id=?", (ad_id, filter_id))
+                    row = c.fetchone()
+                    
+                    if row:
+                        old_price, old_drop = row[0], row[1]
+                        new_drop = old_price - price if price < old_price else old_drop
+                        c.execute('''UPDATE items SET current_price=?, previous_price=?, price_drop=?, 
+                                     description=?, last_updated=?, title=? WHERE ad_id=? AND filter_id=?''', 
+                                  (price, old_price, new_drop, desc_text, now, title, ad_id, filter_id))
+                    else:
+                        c.execute('''INSERT INTO items (ad_id, filter_id, title, link, current_price, previous_price, 
+                                     price_drop, description, last_updated) 
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                  (ad_id, filter_id, title, link, price, price, 0, desc_text, now))
+                    
+                    uspjesno += 1
+                except Exception as e:
                     continue
-                
-                # 4. GODIŠTE I KILOMETRI (Skenira sav tekst unutar oglasa)
-                desc_text = item.text.replace('\xa0', ' ')
-                
-                year = 2019 # Default
-                year_match = re.search(r'Godište:\s*(\d{4})', desc_text) or re.search(r'(2019|202[0-5])\.', desc_text)
-                if year_match: 
-                    # Prilagodba hvatanja grupe ovisno o regex matchu
-                    y_str = year_match.group(1) if len(year_match.groups()) > 0 else year_match.group(0).replace('.', '')
-                    year = int(y_str)
-                
-                mileage = 100000 # Default
-                mil_match = re.search(r'Kilometraža:\s*([\d\.]+)', desc_text) or re.search(r'([\d\.]+)\s*km', desc_text)
-                if mil_match:
-                    mil_str = mil_match.group(1).replace('.', '')
-                    if mil_str.isdigit() and int(mil_str) > 1000:
-                        mileage = int(mil_str)
+            
+            print(f"Uspješno spremljeno: {uspjesno} oglasa za '{f_name}'.")
+        except Exception as e:
+            print(f"Greška na {f_name}: {e}")
+            
+    conn.commit()
+    conn.close()
 
-                # 5. OBRADA U BAZI
-                bb_score = calculate_best_buy(price, year, mileage)
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                c.execute("SELECT current_price, price_drop FROM cars WHERE id=?", (ad_id,))
-                row = c.fetchone()
-                
-                if row:
-                    old_price, old_drop = row[0], row[1]
-                    new_drop = old_price - price if price < old_price else old_drop
-                    c.execute('''UPDATE cars SET current_price=?, previous_price=?, price_drop=?, 
-                                 best_buy_score=?, last_updated=?, title=?, year=?, mileage=? WHERE id=?''', 
-                              (price, old_price, new_drop, bb_score, now, title, year, mileage, ad_id))
-                else:
-                    c.execute('''INSERT INTO cars (id, title, link, current_price, previous_price, 
-                                 year, mileage, price_drop, best_buy_score, last_updated) 
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (ad_id, title, link, price, price, year, mileage, 0, bb_score, now))
-                
-                uspjesno_spremljeno += 1
-                
-            except Exception as e:
-                print(f"-> Preskočeno oglas uslijed neočekivane greške: {e}")
-                continue
-                
-        conn.commit()
-        conn.close()
-        print(f"Završeno! Uspješno spremljeno u bazu: {uspjesno_spremljeno} oglasa.")
-    except Exception as e:
-        print(f"Glavna greška pri spajanju: {e}")
-
+# --- WEB SUČELJE ---
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Njuškalo Tracker</title>
     <style>
-        body { font-family: sans-serif; background: #eceff1; margin: 0; padding: 10px; }
-        .card { background: white; margin-bottom: 15px; padding: 15px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .price { font-size: 20px; font-weight: bold; color: #2e7d32; }
-        .drop { color: white; background: #d32f2f; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-        .best-buy { color: white; background: #f9a825; padding: 2px 6px; border-radius: 4px; font-size: 12px; margin-left: 5px; }
-        .info { font-size: 14px; color: #555; margin: 5px 0; }
-        .ai-box { border-top: 1px solid #eee; margin-top: 10px; padding-top: 10px; font-size: 13px; font-style: italic; }
-        a { text-decoration: none; color: #1565c0; font-weight: bold; }
-        .btn { display: block; width: 90%; background: #333; color: white; text-align: center; padding: 12px; border-radius: 8px; text-decoration: none; margin: 0 auto 20px auto; font-weight: bold; }
+        body { font-family: -apple-system, sans-serif; background: #f0f2f5; margin: 0; padding: 0; }
+        .header { background: #fff; padding: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 100; }
+        .tabs { display: flex; overflow-x: auto; white-space: nowrap; gap: 10px; padding-bottom: 5px; scrollbar-width: none; }
+        .tabs::-webkit-scrollbar { display: none; }
+        .tab { background: #e4e6eb; color: #050505; text-decoration: none; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: 500; }
+        .tab.active { background: #1a73e8; color: white; }
+        .tab-add { background: #333; color: white; }
+        
+        .container { padding: 15px; }
+        .actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .btn-refresh { background: #34a853; color: white; text-decoration: none; padding: 8px 15px; border-radius: 8px; font-weight: bold; font-size: 14px; }
+        
+        .card { background: white; margin-bottom: 12px; padding: 15px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .title { font-size: 16px; font-weight: bold; margin-bottom: 5px; display: block; color: #1a73e8; text-decoration: none; }
+        .info { font-size: 13px; color: #65676b; margin-bottom: 8px; }
+        .price { font-size: 18px; font-weight: bold; color: #1b5e20; }
+        .drop { background: #e53935; color: white; padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: bold; margin-left: 10px; vertical-align: text-bottom;}
+        
+        /* Modal za dodavanje */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 200; justify-content: center; align-items: center; }
+        .modal-content { background: white; padding: 20px; border-radius: 12px; width: 90%; max-width: 400px; }
+        .modal h3 { margin-top: 0; }
+        .modal input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+        .modal button { background: #1a73e8; color: white; border: none; padding: 10px 15px; width: 100%; border-radius: 6px; font-weight: bold; font-size: 16px; }
+        .close-btn { background: #ccc !important; color: black !important; margin-top: 10px; }
     </style>
 </head>
 <body>
-    <h2 style="text-align:center;">🚗 GLC Analitika</h2>
-    <a href="/scrape" class="btn">🔄 OSVJEŽI PODATKE</a>
-    
-    {% if not cars %}
-        <h4 style="text-align:center; color:#d32f2f;">Baza je i dalje prazna. Provjeri log u Termuxu!</h4>
-    {% endif %}
 
-    {% for car in cars %}
-    <div class="card">
-        <a href="{{ car[2] }}" target="_blank">{{ car[1] }}</a>
-        <div class="info">📅 {{ car[5] }}. god | 🛣️ {{ "{:,}".format(car[6]) }} km</div>
-        <div class="price">
-            {{ "{:,}".format(car[3]) }} €
-            {% if car[7] > 0 %}<span class="drop">↓ -{{ car[7] }}€</span>{% endif %}
-            {% if car[8] > 2000 %}<span class="best-buy">🔥 BEST BUY</span>{% endif %}
-        </div>
-        <div class="ai-box">
-            AI Score: {% if car[8] > 0 %} Cijena je {{ car[8] }}€ ispod prosjeka. {% else %} Skuplji {{ car[8]|abs }}€ od prosjeka. {% endif %}
+    <div class="header">
+        <div class="tabs">
+            {% for f in filters %}
+                <a href="/?f={{ f[0] }}" class="tab {% if current_filter == f[0] %}active{% endif %}">{{ f[1] }}</a>
+            {% endfor %}
+            <a href="#" class="tab tab-add" onclick="document.getElementById('addModal').style.display='flex'">+ Dodaj</a>
         </div>
     </div>
-    {% endfor %}
+
+    <div class="container">
+        <div class="actions">
+            <h3 style="margin:0; color:#333;">Oglasi</h3>
+            <a href="/scrape?f={{ current_filter }}" class="btn-refresh">🔄 Osvježi</a>
+        </div>
+        
+        {% if not items %}
+            <div class="card" style="text-align:center; color:#666;">Nema pronađenih oglasa. Osvježi ili provjeri link.</div>
+        {% endif %}
+
+        {% for item in items %}
+        <div class="card">
+            <a href="{{ item[3] }}" target="_blank" class="title">{{ item[2] }}</a>
+            <div class="info">{{ item[7] }}</div>
+            <div class="price">
+                {{ "{:,}".format(item[4]) }} €
+                {% if item[6] > 0 %}
+                    <span class="drop">↓ -{{ item[6] }}€</span>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div id="addModal" class="modal">
+        <div class="modal-content">
+            <h3>Novi Njuškalo Filter</h3>
+            <form action="/add_filter" method="POST">
+                <label style="font-size:12px; color:#555;">Kratki naziv (npr. Stanovi Trešnjevka)</label>
+                <input type="text" name="name" required placeholder="Unesi ime taba...">
+                
+                <label style="font-size:12px; color:#555;">Kopirani URL iz Njuškala</label>
+                <input type="url" name="url" required placeholder="https://www.njuskalo.hr/...">
+                
+                <button type="submit">Spremi i skeniraj</button>
+                <button type="button" class="close-btn" onclick="document.getElementById('addModal').style.display='none'">Odustani</button>
+            </form>
+        </div>
+    </div>
+
 </body>
 </html>
 """
@@ -176,17 +205,46 @@ HTML = """
 def index():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("SELECT * FROM cars ORDER BY best_buy_score DESC")
-    cars = c.fetchall()
+    
+    # Dohvati sve filtere za Tabove
+    c.execute("SELECT id, name FROM filters")
+    filters = c.fetchall()
+    
+    # Koji tab prikazujemo? (Zadani je prvi iz baze)
+    current_filter = request.args.get('f', type=int)
+    if not current_filter and filters:
+        current_filter = filters[0][0]
+        
+    # Dohvati oglase za trenutni tab (sortirano po datumu i padu cijene)
+    c.execute("SELECT * FROM items WHERE filter_id=? ORDER BY price_drop DESC, last_updated DESC", (current_filter,))
+    items = c.fetchall()
+    
     conn.close()
-    return render_template_string(HTML, cars=cars)
+    return render_template_string(HTML, filters=filters, current_filter=current_filter, items=items)
+
+@app.route('/add_filter', methods=['POST'])
+def add_filter():
+    name = request.form['name']
+    url = request.form['url']
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO filters (name, url) VALUES (?, ?)", (name, url))
+    new_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    
+    # Odmah pokreni scrape da se tab napuni
+    scrape_all_filters()
+    return redirect(url_for('index', f=new_id))
 
 @app.route('/scrape')
 def run_scrape():
-    scrape_njuskalo()
-    return '<script>window.location.href="/";</script>'
+    f = request.args.get('f')
+    scrape_all_filters()
+    return redirect(url_for('index', f=f))
 
 if __name__ == '__main__':
     init_db()
-    scrape_njuskalo()
+    # Pokreni inicijalni scrape u pozadini ako je prazno
     app.run(host='0.0.0.0', port=5000)
